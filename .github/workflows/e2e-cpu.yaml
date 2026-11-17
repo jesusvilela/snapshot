@@ -28,6 +28,10 @@ on:
         default: ""
   workflow_dispatch:
     inputs:
+      qualify_affinity:
+        description: "Run a mandatory per-thread CPU affinity round-trip check (expected to detect unpreserved affinity)"
+        type: boolean
+        default: false
       qualify_restore_failure:
         description: "Corrupt a checkpoint and require restore success; this probe must fail"
         type: boolean
@@ -74,6 +78,9 @@ env:
   SNAPSHOT_E2E_MODE: direct
   SNAPSHOT_E2E_CPU_ONLY: "true"
   SNAPSHOT_E2E_TEST_NAMESPACE: snapshot-e2e
+  # Pin the CRIU binary only during manual affinity qualification. The
+  # ordinary workflow retains its normal upstream default.
+  AFFINITY_CRIU_BUILD_ARG: ${{ github.event_name == 'workflow_dispatch' && inputs.qualify_affinity && '--build-arg CRIU_REF=2c2834f0b7d26d3eb5daddf2fee10e242d2b29bd' || '' }}
   SNAPSHOT_E2E_SNAPSHOT_RELEASE: snapshot
   SNAPSHOT_E2E_PVC_NAME: snapshot-pvc
   SNAPSHOT_E2E_PVC_SIZE: 2Gi
@@ -177,6 +184,7 @@ jobs:
           image: agent
           registry: ${{ env.IMAGE_REGISTRY }}
           tags: ${{ env.IMAGE_TAG }}
+          build_args: ${{ env.AFFINITY_CRIU_BUILD_ARG }}
           cache_mode: read
           cache_branch: ${{ env.CACHE_BRANCH }}
           cache_ref_prefix: ${{ env.CACHE_REF_PREFIX }}
@@ -198,7 +206,7 @@ jobs:
           cache_flags="$(hack/ci-cache-flags.sh read agent "${CACHE_BRANCH}")"
           make docker-export-agent-bundle \
             BUNDLE_DEST="${RUNNER_TEMP}/agent-bundle" \
-            DOCKER_BUILD_ARGS="${cache_flags}"
+            DOCKER_BUILD_ARGS="${cache_flags} ${AFFINITY_CRIU_BUILD_ARG}"
           hack/verify-bundle-glibc.sh "${RUNNER_TEMP}/agent-bundle"
 
       - name: Build PageBroker image
@@ -345,6 +353,23 @@ jobs:
             --junitxml="${RUNNER_TEMP}/cpu-e2e-serial-junit.xml" || rc=$?
           exit "${rc}"
 
+      # Manual opt-in: a CRIU dump/restore can succeed while silently losing
+      # per-thread affinity. A red result is the desired evidence on the
+      # unmodified CRIU baseline, not something to treat as a skipped test.
+      # The agent image above and the injected restore bundle use the exact
+      # same pinned CRIU source revision when this qualification is requested.
+      - name: Qualify two-thread CPU affinity round-trip
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.qualify_affinity && steps.cpu_tests.outcome == 'success' }}
+        timeout-minutes: 15
+        env:
+          SNAPSHOT_E2E_QUALIFY_AFFINITY: "true"
+          SNAPSHOT_E2E_REQUIRED_TESTS: test_cpu_affinity_roundtrip_requires_real_thread_readback
+        run: |
+          set -euo pipefail
+          echo "CPU affinity qualification uses pinned CRIU 2c2834f0b7d26d3eb5daddf2fee10e242d2b29bd" >> "${GITHUB_STEP_SUMMARY}"
+          uv run --locked --project e2e pytest e2e/tests/test_cpu_affinity_qualification.py -m cpu -vv -s \
+            --junitxml="${RUNNER_TEMP}/cpu-affinity-qualification.xml"
+
       - name: Verify restore-failure negative control
         if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.qualify_restore_failure && steps.cpu_tests.outcome != 'skipped' }}
         env:
@@ -405,6 +430,9 @@ jobs:
           set +e
           out="${RUNNER_TEMP}/diagnostics"
           mkdir -p "${out}"
+          if [ -f "${RUNNER_TEMP}/cpu-affinity-qualification.xml" ]; then
+            cp "${RUNNER_TEMP}/cpu-affinity-qualification.xml" "${out}/cpu-affinity-qualification.xml"
+          fi
           if [ -f "${RUNNER_TEMP}/cpu-e2e-junit.xml" ]; then
             cp "${RUNNER_TEMP}/cpu-e2e-junit.xml" "${out}/cpu-e2e-junit.xml"
           fi
